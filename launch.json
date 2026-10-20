@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "SherwoodPlayerHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "Quiver",
+    "name": "Sherwood Player",
+    "symbol": "QUIVER",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "SherwoodPlayerHook is an immutable fee jar for the native ETH/QUIVER pool on Robinhood Chain. Quiver takes no constructor arguments. There are no owner, admin, upgrade or configuration functions. beforeInitialize authenticates the PoolManager and the exact pool key, including fee 12500 and tick spacing 60; it does not restrict the initializer's sender. The hook charges floor(ETH amount / 100), separately from the pool's 1.25% LP fee. For exact-input buys and exact-output sells it charges the specified ETH amount in beforeSwap and requires a full native fill; for exact-output buys and exact-input sells it charges the actual ETH delta in afterSwap. Fees are taken into the jar when the manager has enough ETH; otherwise they become ERC-6909 ETH claims. Later swaps redeem available claims, and anyone may call redeemFees() to move backed claims into the jar without triggering a buyback. After fee collection, a liquid jar balance of at least 0.005 ETH triggers an attempt in that swap, subject to available gas. All liquid ETH, including donations, is offered as exact input to the native ETH/IMD Sherwood v2 pool: IMD 0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127, fee 9000, tick spacing 180, hook 0xc33c907127b94303f578d6be551c36f45939e0cc. The swap uses TickMath.MIN_SQRT_PRICE + 1 as the unrestricted downward price bound, with no minimum output beyond requiring positive output and full ETH consumption. All received IMD goes directly to 0x000000000000000000000000000000000000dead; this transfer does not reduce IMD totalSupply. Empty hook data requests the game's default move, and the hook preserves the triggering transaction's tx.origin context. Smart-wallet or relayed transactions may credit the originating signer instead of the trader; game attribution and prizes depend on Sherwood. The buyback uses a self-call capped at 2000000 gas with a 150000 gas reserve. A failed buyback rolls back its game, settlement and burn effects, retaining the jar for a later swap with that transaction's player; low remaining gas skips the attempt. Live Sherwood behavior and prize eligibility are not established by the local mock tests."
+}
