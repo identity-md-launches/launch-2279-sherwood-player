@@ -10,6 +10,10 @@ import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDe
 
 /// @dev Models v2's ETH pot fee, tx.origin attribution, exact-input rule and BUY hook data.
 /// Deliberately adversarial modes exercise the caller's rollback and gas isolation.
+/// Modes: 0 normal, 1 early revert, 2 gas exhaustion, 3 reentry,
+/// 4 bad beforeSwap selector, 5 late revert, 6 bad afterSwap selector,
+/// 7 large revert data, 8 allow partial fills for testing the caller's own validation,
+/// 9 consume the entire input as a fee without delivering output (NoOp attack).
 contract MockSherwood {
     IPoolManager public immutable manager;
     uint256 public mode;
@@ -52,12 +56,18 @@ contract MockSherwood {
             (bool ok,) = reentry.call(reentryData);
             require(ok, "REENTRY_FAILED");
         }
+        if (mode == 7) {
+            assembly ("memory-safe") {
+                revert(mload(0x40), 0x40000)
+            }
+        }
         declared = uint256(-params.amountSpecified);
         limit = params.sqrtPriceLimitX96;
         player = tx.origin;
         plays++;
-        uint256 fee = declared / 20;
+        uint256 fee = mode == 9 ? declared : declared / 20;
         manager.take(key.currency0, address(this), fee);
+        if (mode == 4) return (bytes4(0), toBeforeSwapDelta(int128(uint128(fee)), 0), 0);
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(uint128(fee)), 0), 0);
     }
 
@@ -67,8 +77,12 @@ contract MockSherwood {
         returns (bytes4, int128)
     {
         require(msg.sender == address(manager));
+        if (mode == 5) revert("GAME_FAILED_AFTER_SWAP");
+        if (mode == 6) return (bytes4(0), 0);
         uint256 amount = uint256(-params.amountSpecified);
-        require(uint256(-int256(delta.amount0())) + amount / 20 == amount, "PARTIAL_GAME_FILL");
+        if (mode != 8 && mode != 9) {
+            require(uint256(-int256(delta.amount0())) + amount / 20 == amount, "PARTIAL_GAME_FILL");
+        }
         return (IHooks.afterSwap.selector, 0);
     }
 
