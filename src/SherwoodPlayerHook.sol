@@ -12,11 +12,13 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 
 /// @notice Immutable native ETH fee jar that makes Sherwood BUY moves and burns the output.
 /// @dev Only the three enabled hook callbacks are implemented. No owner, approvals or upgrades.
 contract SherwoodPlayerHook is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
+    using TransientStateLibrary for IPoolManager;
 
     error NotPoolManager();
     error NotSelf();
@@ -47,6 +49,7 @@ contract SherwoodPlayerHook is IUnlockCallback {
     event FeesRedeemed(uint256 amount);
     event BuybackSucceeded(address indexed player, uint256 ethSpent, uint256 imdBurned);
     event BuybackFailed(address indexed player, uint256 ethAttempted);
+    event BuybackDeferred(address indexed player, uint256 ethHeld);
 
     constructor(IPoolManager manager_, address token_) {
         if (address(manager_) == address(0) || token_ == address(0) || token_ == IMD) {
@@ -91,10 +94,7 @@ contract SherwoodPlayerHook is IUnlockCallback {
         bool nativeSpecified = (params.amountSpecified < 0) == params.zeroForOne;
         uint256 fee;
         if (nativeSpecified) {
-            uint256 amount = params.amountSpecified < 0
-                ? uint256(-(params.amountSpecified + 1)) + 1
-                : uint256(params.amountSpecified);
-            fee = amount / FEE_DENOMINATOR;
+            fee = _fee(_specified(params), params.amountSpecified < 0);
             // The specified delta is signed int128 in v4. Bound before narrowing.
             if (fee > uint256(uint128(type(int128).max))) revert InvalidConfiguration();
             _collect(fee);
@@ -114,16 +114,13 @@ contract SherwoodPlayerHook is IUnlockCallback {
         if (nativeSpecified) {
             // A specified fee was reserved before the trade. Refuse partial native fills rather
             // than taxing an unexecuted budget. Unspecified native fills are charged on actual ETH.
-            uint256 specified = params.amountSpecified < 0
-                ? uint256(-(params.amountSpecified + 1)) + 1
-                : uint256(params.amountSpecified);
-            uint256 reserved = specified / FEE_DENOMINATOR;
+            uint256 reserved = _fee(_specified(params), params.amountSpecified < 0);
             int256 expected = params.amountSpecified + int256(reserved);
             if (int256(delta.amount0()) != expected) revert PartialFill();
         } else {
             int128 ethDelta = delta.amount0();
             uint256 amount = ethDelta < 0 ? uint256(-int256(ethDelta)) : uint256(int256(ethDelta));
-            fee = amount / FEE_DENOMINATOR;
+            fee = _fee(amount, params.amountSpecified < 0);
             _collect(fee);
         }
         _attemptBuyback();
@@ -151,6 +148,7 @@ contract SherwoodPlayerHook is IUnlockCallback {
         if (msg.sender != address(this)) revert NotSelf();
         if (!busy || amount < THRESHOLD || amount != address(this).balance) revert InvalidBuyback();
         // Prepay: Sherwood's beforeSwap takes its pot fee before the swap router settles.
+        // _attemptBuyback only gets here with no currency synced, so this reset clears nothing.
         poolManager.sync(Currency.wrap(address(0)));
         poolManager.settle{value: amount}();
         BalanceDelta delta = poolManager.swap(
@@ -170,6 +168,17 @@ contract SherwoodPlayerHook is IUnlockCallback {
 
     function _checkPool(PoolKey calldata key) private view {
         if (PoolId.unwrap(key.toId()) != PoolId.unwrap(poolId)) revert WrongPool();
+    }
+
+    function _specified(SwapParams calldata params) private pure returns (uint256) {
+        return params.amountSpecified < 0 ? uint256(-(params.amountSpecified + 1)) + 1 : uint256(params.amountSpecified);
+    }
+
+    /// @dev The fee is 1% of the gross ETH leg in every swap mode. On exact input the ETH amount
+    /// is already gross; on exact output it excludes the fee, so gross up: fee = amount / 99 makes
+    /// fee == (amount + fee) / 100 exactly under floor division.
+    function _fee(uint256 ethAmount, bool exactInput) private pure returns (uint256) {
+        return exactInput ? ethAmount / FEE_DENOMINATOR : ethAmount / (FEE_DENOMINATOR - 1);
     }
 
     function _collect(uint256 fee) private {
@@ -193,6 +202,13 @@ contract SherwoodPlayerHook is IUnlockCallback {
     function _attemptBuyback() private {
         uint256 amount = address(this).balance;
         if (amount < THRESHOLD || gasleft() <= GAS_RESERVE) return;
+        // The prepayment below needs the manager's single synced-currency slot. A router that
+        // synced its ERC-20 input before this swap and settles after it would lose that sync, so
+        // its unlock would revert CurrencyNotSettled. Leave the jar alone and retry on a later swap.
+        if (!poolManager.getSyncedCurrency().isAddressZero()) {
+            emit BuybackDeferred(tx.origin, amount);
+            return;
+        }
         busy = true;
         bytes memory payload = abi.encodeCall(this.executeBuyback, (amount));
         bool ok;

@@ -6,6 +6,7 @@ import {Quiver} from "../src/Quiver.sol";
 import {SherwoodPlayerHook} from "../src/SherwoodPlayerHook.sol";
 import {PoolDriver} from "./helpers/PoolDriver.sol";
 import {MockSherwood} from "./helpers/MockSherwood.sol";
+import {PrepayRouter} from "./helpers/PrepayRouter.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
@@ -67,7 +68,8 @@ contract SherwoodPlayerHookTest is HookFixture {
         BalanceDelta delta = _swap(true, 0.1 ether);
         uint256 paid = uint256(-int256(delta.amount0()));
         uint256 fee = address(hook).balance;
-        assertEq(fee, (paid - fee) / 100);
+        assertEq(fee, paid / 100);
+        assertEq(fee, (paid - fee) / 99);
         assertEq(delta.amount1(), 0.1 ether);
     }
 
@@ -82,10 +84,65 @@ contract SherwoodPlayerHookTest is HookFixture {
     }
 
     function test_exactOutputSellFee() public {
+        uint256 poolETH = address(manager).balance;
         BalanceDelta delta = _swap(false, 0.1 ether);
         assertEq(delta.amount0(), 0.1 ether);
-        assertEq(address(hook).balance, 0.001 ether);
+        uint256 fee = address(hook).balance;
+        assertEq(fee, uint256(0.1 ether) / 99);
+        // The pool paid the requested output plus the fee; the fee is 1% of that gross leg.
+        assertEq(poolETH - address(manager).balance, 0.1 ether + fee);
+        assertEq(fee, (0.1 ether + fee) / 100);
         assertLt(delta.amount1(), 0);
+    }
+
+    function test_feeBaseIsGrossETHInEveryMode() public {
+        // Exact-input sell: the pool pays gross G, the seller nets G - G/100.
+        BalanceDelta sellIn = _swap(false, -0.1 ether);
+        uint256 feeIn = address(hook).balance;
+        uint256 grossIn = uint256(int256(sellIn.amount0())) + feeIn;
+        assertEq(feeIn, grossIn / 100);
+        // Exact-output sell for that same net: the pool pays the same gross and the jar gets the same fee.
+        uint256 jar = address(hook).balance;
+        BalanceDelta sellOut = _swap(false, int256(uint256(int256(sellIn.amount0()))));
+        uint256 feeOut = address(hook).balance - jar;
+        assertEq(sellOut.amount0(), sellIn.amount0());
+        assertEq(feeOut, uint256(int256(sellOut.amount0())) / 99);
+        assertApproxEqAbs(feeOut, feeIn, 2); // Only the AMM path's wei rounding differs.
+    }
+
+    function test_prepayingRouterSellSucceedsAndDefersBuyback() public {
+        PrepayRouter router = new PrepayRouter(manager);
+        token.transfer(address(router), 10 ether);
+        vm.deal(address(hook), 0.005 ether);
+        uint256 routerETH = address(router).balance;
+        // Deferred after this sell's own fee joined the jar, attributed to the originating signer.
+        vm.expectEmit(true, false, false, false, address(hook));
+        emit SherwoodPlayerHook.BuybackDeferred(address(0xB0B), 0);
+        vm.prank(address(0xB0B), address(0xB0B));
+        BalanceDelta delta = router.sell(key, 0.1 ether);
+        assertGt(delta.amount0(), 0);
+        assertEq(address(router).balance - routerETH, uint256(int256(delta.amount0())));
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+        assertEq(game.plays(), 0);
+        // The sell's own fee joined the jar; nothing was spent or lost.
+        uint256 fee = address(hook).balance - 0.005 ether;
+        assertEq(fee, (uint256(int256(delta.amount0())) + fee) / 100);
+        // A router that leaves the slot clear runs the buyback with the jar intact.
+        uint256 jar = address(hook).balance;
+        _swap(true, -0.01 ether);
+        assertEq(game.plays(), 1);
+        assertEq(game.player(), PLAYER);
+        assertEq(game.declared(), jar + 0.0001 ether);
+        assertEq(address(hook).balance, 0);
+    }
+
+    function test_prepayingRouterSellWithEmptyJarIsUnaffected() public {
+        PrepayRouter router = new PrepayRouter(manager);
+        token.transfer(address(router), 10 ether);
+        BalanceDelta delta = router.sell(key, 0.1 ether);
+        assertGt(delta.amount0(), 0);
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+        assertEq(address(hook).balance, (uint256(int256(delta.amount0())) + address(hook).balance) / 100);
     }
 
     function test_thresholdCrossingBuysAllAndBurns() public {
@@ -267,14 +324,12 @@ contract SherwoodPlayerHookTest is HookFixture {
         uint256 initialTokens = token.balanceOf(address(manager)) + token.balanceOf(address(driver));
         BalanceDelta delta = _swap(buy, exactInput ? -int256(amount) : int256(amount));
         uint256 fee = address(hook).balance;
-        bool specifiedNative = exactInput == buy;
-        if (specifiedNative) {
-            assertEq(fee, amount / 100);
-        } else {
-            uint256 netETH = delta.amount0() < 0 ? uint256(-int256(delta.amount0())) : uint256(int256(delta.amount0()));
-            uint256 gross = buy ? netETH - fee : netETH + fee;
-            assertEq(fee, gross / 100);
-        }
+        // The trader's ETH delta includes the fee on buys and excludes it on sells; the gross ETH
+        // leg between trader and pool is taxed at exactly 1% in all four modes.
+        uint256 userETH = delta.amount0() < 0 ? uint256(-int256(delta.amount0())) : uint256(int256(delta.amount0()));
+        uint256 gross = buy ? userETH : userETH + fee;
+        assertEq(fee, gross / 100);
+        if (exactInput == buy) assertEq(fee, exactInput ? amount / 100 : amount / 99);
         assertEq(address(manager).balance + address(driver).balance + fee, initialETH);
         assertEq(token.balanceOf(address(manager)) + token.balanceOf(address(driver)), initialTokens);
     }
