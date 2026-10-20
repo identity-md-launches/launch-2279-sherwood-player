@@ -65,8 +65,10 @@ contract JarHandler is Test {
     uint256 public failedBuys;
     uint256 public trades;
     uint256 public redemptions;
+    uint256 public deferredBuys;
 
     bytes32 constant SWAP_EVENT = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
+    bytes32 constant DEFERRED_EVENT = keccak256("BuybackDeferred(address,uint256)");
 
     constructor(
         SherwoodPlayerHook hook_,
@@ -87,16 +89,38 @@ contract JarHandler is Test {
         donor = new ClaimDonor(manager);
     }
 
-    function trade(uint8 who, bool buy, bool exactInput, uint96 raw, uint8 rawMode) external {
+    struct Before {
+        uint256 plays;
+        uint256 burn;
+        uint256 gameETH;
+        uint256 assets;
+    }
+
+    /// @param preSync the router syncs QUIVER before each swap, occupying the manager's synced-currency slot.
+    function trade(uint8 who, bool buy, bool exactInput, uint96 raw, uint8 rawMode, bool preSync) external {
         uint256 amount = bound(raw, 100, 0.75 ether);
         uint256 mode = bound(rawMode, 0, 3);
         // Exercise both early failures and failures after the pot payment and AMM swap.
         game.setMode(mode == 0 ? 0 : mode == 1 ? 1 : mode == 2 ? 5 : 6);
-        uint256 previousPlays = game.plays();
-        uint256 previousBurn = imd.balanceOf(hook.BURN());
-        uint256 previousGameETH = address(game).balance;
-        uint256 assetsBefore = address(hook).balance + manager.balanceOf(address(hook), 0);
-        uint256 index = uint256(who) % 3;
+        Before memory b = Before(
+            game.plays(),
+            imd.balanceOf(hook.BURN()),
+            address(game).balance,
+            address(hook).balance + manager.balanceOf(address(hook), 0)
+        );
+        address actor = actors[uint256(who) % 3];
+        (uint256 fee, Vm.Log[] memory logs) = _trade(uint256(who) % 3, buy, exactInput, amount, preSync);
+        totalFees += fee;
+        ++trades;
+        _checkOutcome(b, b.assets + fee, actor, mode, preSync, logs);
+        assertEq(manager.balanceOf(address(hook), 0), 0, "funded manager must redeem claims");
+        assertEq(address(hook).balance + totalSpent, totalFees + totalDonations);
+    }
+
+    function _trade(uint256 index, bool buy, bool exactInput, uint256 amount, bool preSync)
+        private
+        returns (uint256 fee, Vm.Log[] memory logs)
+    {
         SwapParams[] memory params = new SwapParams[](1);
         params[0] = SwapParams(
             buy,
@@ -105,33 +129,43 @@ contract JarHandler is Test {
         );
         vm.recordLogs();
         vm.prank(actors[index], actors[index]);
-        BalanceDelta[] memory results = routers[index].batch(key, params, true, false);
-        int128 poolETH = _executedETH(vm.getRecordedLogs());
-        uint256 basis = buy == exactInput ? amount : _abs(poolETH);
-        uint256 fee = basis / 100;
-        assertEq(int256(poolETH) - int256(results[0].amount0()), int256(fee), "wrong native fee");
-        totalFees += fee;
-        ++trades;
+        BalanceDelta[] memory results = routers[index].batch(key, params, preSync, false);
+        logs = vm.getRecordedLogs();
+        fee = _checkedFee(buy, exactInput, amount, _executedETH(logs), results[0].amount0());
+    }
 
-        uint256 available = assetsBefore + fee;
-        if (available >= 0.005 ether && mode == 0) {
-            assertEq(game.plays(), previousPlays + 1, "eligible buy must execute");
-            assertEq(game.player(), actors[index], "tipping trader must be credited");
+    function _checkOutcome(
+        Before memory b,
+        uint256 available,
+        address actor,
+        uint256 mode,
+        bool preSync,
+        Vm.Log[] memory logs
+    ) private {
+        if (available >= 0.005 ether && preSync) {
+            // A pre-synced router must not have its sync cleared by the buyback's native prepayment.
+            assertTrue(_has(logs, DEFERRED_EVENT, actor, available), "pre-synced swap must defer");
+            assertEq(game.plays(), b.plays, "pre-synced swap must not play");
+            assertEq(imd.balanceOf(hook.BURN()), b.burn);
+            assertEq(address(game).balance, b.gameETH);
+            assertEq(address(hook).balance, available, "deferral must keep the whole jar");
+            ++deferredBuys;
+        } else if (available >= 0.005 ether && mode == 0) {
+            assertEq(game.plays(), b.plays + 1, "eligible buy must execute");
+            assertEq(game.player(), actor, "tipping trader must be credited");
             assertEq(game.declared(), available, "buy must spend the entire jar");
-            uint256 burned = imd.balanceOf(hook.BURN()) - previousBurn;
+            uint256 burned = imd.balanceOf(hook.BURN()) - b.burn;
             assertGt(burned, 0, "successful buy must burn actual output");
             assertEq(address(hook).balance, 0);
             totalSpent += available;
             totalBurned += burned;
             ++successfulBuys;
         } else {
-            assertEq(game.plays(), previousPlays, "failed or ineligible play persisted");
-            assertEq(imd.balanceOf(hook.BURN()), previousBurn, "failed buy leaked tokens");
-            assertEq(address(game).balance, previousGameETH, "failed buy leaked ETH");
+            assertEq(game.plays(), b.plays, "failed or ineligible play persisted");
+            assertEq(imd.balanceOf(hook.BURN()), b.burn, "failed buy leaked tokens");
+            assertEq(address(game).balance, b.gameETH, "failed buy leaked ETH");
             if (available >= 0.005 ether) ++failedBuys;
         }
-        assertEq(manager.balanceOf(address(hook), 0), 0, "funded manager must redeem claims");
-        assertEq(address(hook).balance + totalSpent, totalFees + totalDonations);
     }
 
     function donateETH(uint96 raw) external {
@@ -196,6 +230,29 @@ contract JarHandler is Test {
             }
         }
         revert("missing project swap");
+    }
+
+    /// @dev 1% of the gross ETH leg: what the buyer pays in total, or what the pool pays out before the fee.
+    function _checkedFee(bool buy, bool exactInput, uint256 amount, int128 poolETH, int128 traderETH)
+        private
+        pure
+        returns (uint256 fee)
+    {
+        fee = uint256(int256(poolETH) - int256(traderETH));
+        uint256 gross = buy ? (exactInput ? amount : _abs(poolETH) + fee) : (exactInput ? _abs(poolETH) : amount + fee);
+        assertLe(fee * 100, gross, "fee above 1% of the gross ETH leg");
+        assertLt(gross, (fee + 1) * 100, "fee below 1% of the gross ETH leg");
+    }
+
+    function _has(Vm.Log[] memory logs, bytes32 topic, address player, uint256 amount) private view returns (bool) {
+        for (uint256 i; i < logs.length; ++i) {
+            if (
+                logs[i].emitter == address(hook) && logs[i].topics[0] == topic
+                    && logs[i].topics[1] == bytes32(uint256(uint160(player)))
+                    && abi.decode(logs[i].data, (uint256)) == amount
+            ) return true;
+        }
+        return false;
     }
 
     function _abs(int128 n) private pure returns (uint256) {

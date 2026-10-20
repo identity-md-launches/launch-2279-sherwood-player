@@ -92,12 +92,13 @@ contract SherwoodDeferredTest is HookFixture {
         BalanceDelta delta = _swap(true, exactInput ? -int256(amount) : int256(amount));
         uint256 paid = uint256(-int256(delta.amount0()));
         uint256 claim = manager.balanceOf(address(hook), 0);
-        uint256 basis = exactInput ? amount : paid - claim;
+        // A buy's gross ETH leg is everything the buyer pays, fee included.
         assertEq(address(hook).balance, 0);
         assertEq(address(manager).balance, paid);
         assertEq(address(driver).balance, beforeETH - paid);
-        assertLe(claim * 100, basis);
-        assertLt(basis, (claim + 1) * 100);
+        if (exactInput) assertEq(paid, amount);
+        assertLe(claim * 100, paid);
+        assertLt(paid, (claim + 1) * 100);
         vm.prank(makeAddr("permissionless keeper"));
         hook.redeemFees();
         assertEq(address(hook).balance, claim);

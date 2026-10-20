@@ -39,6 +39,7 @@ contract SherwoodAdversarialTest is HookFixture {
     bytes32 constant SWAP_EVENT = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
     bytes32 constant SUCCESS_EVENT = keccak256("BuybackSucceeded(address,uint256,uint256)");
     bytes32 constant FAILURE_EVENT = keccak256("BuybackFailed(address,uint256)");
+    bytes32 constant DEFERRED_EVENT = keccak256("BuybackDeferred(address,uint256)");
 
     function test_constructorRejectsInvalidInputsAndIncorrectAddressFlags() public {
         HookConstructionProbe deployer = new HookConstructionProbe();
@@ -166,9 +167,7 @@ contract SherwoodAdversarialTest is HookFixture {
         assertEq(int256(address(driver).balance) - int256(beforeETH), int256(result.amount0()));
         assertEq(int256(token.balanceOf(address(driver))) - int256(beforeToken), int256(result.amount1()));
         assertEq(lpFee, 12500, "hook must not override the launch LP fee");
-        uint256 basis = (buy == exactInput) ? amount : _abs(poolETH);
-        assertLe(fee * 100, basis);
-        assertLt(basis, (fee + 1) * 100, "fee rounds down by less than one wei");
+        _assertGrossLegFee(buy, exactInput, amount, poolETH, result.amount0(), fee);
         assertEq(manager.balanceOf(address(hook), 0), 0);
         assertEq(game.plays(), 0);
     }
@@ -282,14 +281,14 @@ contract SherwoodAdversarialTest is HookFixture {
         assertEq(address(hook).balance, 0);
     }
 
-    function test_repeatedBuybacksWithinOneUnlockSettleEvenAfterERC20Sync() public {
+    function test_repeatedBuybacksWithinOneUnlockSettle() public {
         SettlementProbe probe = new SettlementProbe(manager, hook.IMD());
         vm.deal(address(probe), 2 ether);
         SwapParams[] memory params = new SwapParams[](2);
         params[0] = SwapParams(true, -0.5 ether, TickMath.MIN_SQRT_PRICE + 1);
         params[1] = params[0];
         vm.prank(PLAYER, PLAYER);
-        BalanceDelta[] memory deltas = probe.batch(key, params, true, true);
+        BalanceDelta[] memory deltas = probe.batch(key, params, false, true);
         assertEq(probe.settledSwaps(), 2);
         assertEq(game.plays(), 2, "busy flag must reset within the transaction");
         assertEq(game.player(), PLAYER);
@@ -297,6 +296,59 @@ contract SherwoodAdversarialTest is HookFixture {
         assertEq(address(hook).balance, 0);
         assertEq(address(probe).balance, 1 ether);
         assertEq(token.balanceOf(address(probe)), uint256(int256(deltas[0].amount1()) + int256(deltas[1].amount1())));
+    }
+
+    function test_routerThatSyncsBeforeEverySwapStillSettlesAndTheJarWaits() public {
+        SettlementProbe probe = new SettlementProbe(manager, hook.IMD());
+        vm.deal(address(probe), 2 ether);
+        SwapParams[] memory params = new SwapParams[](2);
+        params[0] = SwapParams(true, -0.5 ether, TickMath.MIN_SQRT_PRICE + 1);
+        params[1] = params[0];
+        bytes32 beforePool = _targetState();
+        vm.recordLogs();
+        vm.prank(PLAYER, PLAYER);
+        probe.batch(key, params, true, true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(probe.settledSwaps(), 2, "pre-synced router must still settle");
+        uint256[2] memory held = [uint256(0.005 ether), 0.01 ether];
+        uint256 deferrals;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(hook)) continue;
+            assertTrue(logs[i].topics[0] != FAILURE_EVENT && logs[i].topics[0] != SUCCESS_EVENT);
+            if (logs[i].topics[0] != DEFERRED_EVENT) continue;
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), PLAYER);
+            assertEq(abi.decode(logs[i].data, (uint256)), held[deferrals++]);
+        }
+        assertEq(deferrals, 2, "each full-jar swap defers once");
+        assertEq(game.plays(), 0);
+        assertEq(_targetState(), beforePool, "deferral must not touch the target pool");
+        assertEq(address(hook).balance, 0.01 ether, "deferral must keep the whole jar");
+        assertEq(imd.balanceOf(hook.BURN()), 0);
+
+        address later = makeAddr("later clear-slot trader");
+        vm.prank(later, later);
+        driver.swap(key, SwapParams(true, -100, TickMath.MIN_SQRT_PRICE + 1));
+        assertEq(game.plays(), 1);
+        assertEq(game.player(), later);
+        assertEq(game.declared(), 0.01 ether + 1);
+        assertEq(address(hook).balance, 0);
+        assertGt(imd.balanceOf(hook.BURN()), 0);
+    }
+
+    function test_preSyncBelowThresholdEmitsNothing() public {
+        SettlementProbe probe = new SettlementProbe(manager, hook.IMD());
+        vm.deal(address(probe), 1 ether);
+        SwapParams[] memory params = new SwapParams[](1);
+        params[0] = SwapParams(true, -0.4 ether, TickMath.MIN_SQRT_PRICE + 1);
+        vm.recordLogs();
+        probe.batch(key, params, true, false);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(
+                logs[i].emitter != address(hook) || logs[i].topics[0] != DEFERRED_EVENT, "no deferral below 0.005"
+            );
+        }
+        assertEq(address(hook).balance, 0.004 ether);
     }
 
     function test_successEventMatchesTheFullJarAndActualBurn() public {
@@ -347,6 +399,18 @@ contract SherwoodAdversarialTest is HookFixture {
         (uint160 price, int24 tick, uint24 protocolFee, uint24 lpFee) = manager.getSlot0(id);
         (uint256 fee0, uint256 fee1) = manager.getFeeGrowthGlobals(id);
         return keccak256(abi.encode(price, tick, protocolFee, lpFee, fee0, fee1, manager.getLiquidity(id)));
+    }
+
+    /// @dev 1% of the gross ETH leg: the buyer's total ETH, or the pool's ETH output before the fee.
+    function _assertGrossLegFee(bool buy, bool exactInput, uint256 amount, int128 poolETH, int128 trader, uint256 fee)
+        internal
+        pure
+    {
+        uint256 gross = buy ? (exactInput ? amount : _abs(poolETH) + fee) : (exactInput ? _abs(poolETH) : amount + fee);
+        assertLe(fee * 100, gross);
+        assertLt(gross, (fee + 1) * 100, "fee rounds down by less than one wei");
+        // The trader's own ETH figure: paid in total on a buy, received net on a sell.
+        assertEq(buy ? _abs(trader) : _abs(trader) + fee, gross, "fee must be on top of buys and out of sells");
     }
 
     function _abs(int128 n) internal pure returns (uint256) {

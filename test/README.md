@@ -11,9 +11,9 @@ The earlier contributor's tests remain in place. The additions cover:
 
 | Suite | Properties exercised |
 | --- | --- |
-| `SherwoodAdversarial.t.sol` | Constructor rejection, every pool-key field, all permission flags, signed extremes, threshold/dust boundaries, all four fee paths against actual PoolManager swap events and router balances, round trips, late game failures, malformed responses, large revert payloads, false-returning burn transfers, partial/zero-output buybacks, recursive swaps, two buybacks within one unlock, and buyback event contents. |
+| `SherwoodAdversarial.t.sol` | Constructor rejection, every pool-key field, all permission flags, signed extremes, threshold/dust boundaries, all four fee paths against actual PoolManager swap events and router balances, round trips, late game failures, malformed responses, large revert payloads, false-returning burn transfers, partial/zero-output buybacks, recursive swaps, two buybacks within one unlock, and buyback event contents. A router that syncs QUIVER before each swap still settles: full-jar swaps emit `BuybackDeferred` with the jar's amount and leave the target pool alone, and the next clear-slot trader plays the whole jar. Below the threshold nothing is deferred. |
 | `SherwoodDeferred.t.sol` | Fresh PoolManager with both pools seeded using tokens only; backed fee claims, redemption by anyone, repeated redemption, deferred batch settlement, next-trader attribution, and buyback prepayment when the manager initially has no ETH. |
-| `JarAccounting.invariant.t.sol` | 256 sequences of 96 calls mixing three funded traders, all swap directions/modes, early and late game failures, native/claim donations, redemptions, LP fee collection, and unauthorized execution attempts. |
+| `JarAccounting.invariant.t.sol` | 256 sequences of 96 calls mixing three funded traders, all swap directions/modes, routers with and without a pre-swap sync (pre-synced full-jar swaps must defer and keep the jar), early and late game failures, native/claim donations, redemptions, LP fee collection, and unauthorized execution attempts. |
 | `QuiverStateful.t.sol` | 256 sequences of 64 calls across four holders: transfers, approvals, delegated spending, excessive spending, and revocation. Independent balance and allowance ledgers must match the token, whose supply stays fixed. |
 | `Quiver.t.sol` additions | Zero/self transfers, zero recipients, unauthorized spending, allowance rollback on insufficient balance, and the full supply with infinite approval. |
 
@@ -38,9 +38,12 @@ balances with cheatcodes. `SettlementProbe` checks transient debts **inside**
 the unlock callback, including while the router still owes its input; checking
 transient storage after a top-level call would not establish this on Forge 1.8.
 
-Fee expectations use the implementation's documented conventions: specified ETH
-uses the requested input budget or net output; unspecified ETH uses the actual
-AMM delta. The LP fee is checked separately. Successful buys must spend the whole
+Fee expectations follow the implementation's documented rule: the fee is 1% of
+the **gross ETH leg**, rounded down. That leg is the ETH a buyer pays in total,
+fee included, or the ETH the pool pays out before the fee comes off a sell. The
+tests derive the gross leg from the PoolManager's `Swap` event and the router's
+own balance change, without reusing the hook's `/100` and `/99` formulas, and
+check `fee * 100 <= gross < (fee + 1) * 100`. The LP fee is checked separately. Successful buys must spend the whole
 liquid jar, credit the triggering transaction origin, and transfer positive IMD
 output to the fixed burn address.
 

@@ -69,16 +69,21 @@ contract JarAccountingInvariantTest is HookFixture {
     }
 
     function test_handlerExercisesFailuresClaimsRedemptionsAndRecovery() public {
-        handler.trade(0, true, true, 0.5 ether, 1);
+        handler.trade(0, true, true, 0.5 ether, 1, false);
         assertEq(handler.failedBuys(), 1);
+        handler.trade(1, false, false, 0.001 ether, 0, true);
+        assertEq(handler.deferredBuys(), 1);
+        assertEq(game.plays(), 0);
         handler.donateClaims(0.002 ether);
         assertEq(manager.balanceOf(address(hook), 0), 0.002 ether);
         handler.redeem(1);
         handler.donateETH(0.001 ether);
         handler.unauthorizedBuy(2, 0.008 ether);
-        handler.trade(2, true, true, 100, 0);
+        uint256 jar = address(hook).balance;
+        handler.trade(2, true, true, 100, 0, false);
         assertEq(handler.successfulBuys(), 1);
-        assertEq(handler.totalSpent(), 0.008 ether + 1);
+        assertEq(handler.totalSpent(), jar + 1);
+        assertGt(jar, 0.008 ether, "the deferred sell's fee must stay in the jar");
         handler.collectLPFees();
         invariant_everyWeiIsStillInTheJarAClaimOrASuccessfulBuy();
         invariant_everySuccessfulBuyBurnsItsOutputAndNoOtherCallDoes();
